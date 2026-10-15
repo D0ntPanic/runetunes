@@ -30,9 +30,11 @@ impl Cache {
             if let Ok(index_file) = std::fs::read(path.join(format!("main_file_cache.idx{}", i))) {
                 // Index files are made up of 6 byte entries, with two 24-bit fields. The fields
                 // contain the length of the group's data and the chunk index in the main data file.
+                // Trailing bytes that don't form a whole entry are ignored (Old School clients
+                // leave 1-byte index files for unused archives).
                 let mut index_file = Buffer::new(index_file);
                 let mut entries = Vec::new();
-                while !index_file.at_end() {
+                while index_file.bytes_remaining() >= 6 {
                     let length = index_file.get_u24()?;
                     let chunk = index_file.get_u24()?;
                     entries.push(CacheEntry {
@@ -82,21 +84,28 @@ impl Cache {
 
         // Repeat until the entire group is read
         while result.len() < entry.length {
-            // Compute remaining length. If greater than the chunk size (512), read the entire
-            // chunk's data.
+            // Each chunk is 520 bytes: a header followed by data. Groups with IDs above 65535
+            // have a 10 byte header with a 32-bit group ID instead of the usual 8 byte one.
+            let (header_size, group_size) = if entry.group > 0xffff {
+                (10, 4)
+            } else {
+                (8, 2)
+            };
             let remaining = entry.length - result.len();
-            let chunk_size = 512.min(remaining);
-
-            // Compute chunk offset in the main data file. Each chunk is 520 bytes (512 bytes
-            // of data and an 8 byte header).
+            let chunk_size = (520 - header_size).min(remaining);
             let start = chunk * 520;
+            let header = self
+                .data
+                .get(start..start + header_size + chunk_size)
+                .ok_or_else(|| anyhow!("Cache entry outside of the data file"))?;
 
             // Decode chunk header and validate it
-            let expected_group =
-                u16::from_be_bytes([self.data[start], self.data[start + 1]]) as usize;
-            let expected_archive = self.data[start + 7] as usize;
-            let expected_chunk_index =
-                u16::from_be_bytes([self.data[start + 2], self.data[start + 3]]) as usize;
+            let expected_group = header[..group_size]
+                .iter()
+                .fold(0usize, |id, &byte| id << 8 | byte as usize);
+            let fields = &header[group_size..];
+            let expected_chunk_index = u16::from_be_bytes([fields[0], fields[1]]) as usize;
+            let expected_archive = fields[5] as usize;
             if expected_group != entry.group
                 || expected_archive != entry.archive
                 || expected_chunk_index != chunk_index
@@ -105,15 +114,10 @@ impl Cache {
             }
 
             // Seek to next chunk
-            chunk = u32::from_be_bytes([
-                0,
-                self.data[start + 4],
-                self.data[start + 5],
-                self.data[start + 6],
-            ]) as usize;
+            chunk = u32::from_be_bytes([0, fields[2], fields[3], fields[4]]) as usize;
 
             // Append chunk data to the result
-            result.extend_from_slice(&self.data[start + 8..start + 8 + chunk_size]);
+            result.extend_from_slice(&header[header_size..]);
             chunk_index += 1;
         }
 
@@ -123,7 +127,7 @@ impl Cache {
 
     /// Unpacks a cached group's data
     fn unpack(data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-        if data.len() == 0 {
+        if data.is_empty() {
             // Empty file
             return Ok(Vec::new());
         }
@@ -132,7 +136,7 @@ impl Cache {
 
         // Header includes compression type and compressed length
         let compression_type = data.get_u8()?;
-        let length = data.get_u32()?;
+        let _length = data.get_u32()?;
 
         if compression_type == 0 {
             // Uncompressed data doesn't need an uncompressed length, only the data follows

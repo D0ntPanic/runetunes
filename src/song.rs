@@ -1,13 +1,14 @@
 use crate::buffer::{Buffer, OutputBuffer};
 use crate::data::Data;
-use crate::instrument::Instrument;
 use anyhow::{anyhow, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub struct Song {
     pub tracks: Vec<Track>,
+    /// Events of all tracks merged in playback order: by time, then by track index. This is the
+    /// order the client's sequencer processes them in.
     pub events: Vec<TrackEvent>,
-    pub instruments: BTreeMap<u32, Instrument>,
+    /// Ticks per quarter note.
     pub division: u16,
 }
 
@@ -55,14 +56,17 @@ pub enum Event {
         note: u8,
         pressure: u8,
     },
-    BankSelect {
+    /// MIDI program change, as stored in the track.
+    ProgramChange {
         channel: u8,
-        bank: u8,
+        program: u8,
     },
+    /// Program change with the patch it selects resolved using the channel's bank select
+    /// controllers (only present in the merged `Song::events` list).
     ProgramSelect {
         channel: u8,
-        bank: u8,
-        program: u32,
+        program: u8,
+        patch: u32,
     },
 }
 
@@ -307,8 +311,10 @@ impl Song {
                             });
                         }
                         3 => {
-                            pitch_wheel =
-                                pitch_wheel.wrapping_add(pitch_wheel_lsb_data.get_u8()? as u16);
+                            // The deltas are signed bytes. The sign extension matters for the
+                            // LSB, as a borrow from it changes the MSB.
+                            pitch_wheel = pitch_wheel
+                                .wrapping_add(pitch_wheel_lsb_data.get_i8()? as i16 as u16);
                             pitch_wheel = pitch_wheel
                                 .wrapping_add((pitch_wheel_msb_data.get_u8()? as u16) << 7);
                             track.events.push(TrackEvent {
@@ -350,9 +356,9 @@ impl Song {
                         6 => track.events.push(TrackEvent {
                             track: track_idx,
                             time,
-                            event: Event::BankSelect {
+                            event: Event::ProgramChange {
                                 channel,
-                                bank: bank_select_data.get_u8()?,
+                                program: bank_select_data.get_u8()?,
                             },
                         }),
                         _ => return Err(anyhow!("Invalid status: {}", status_and_channel)),
@@ -361,6 +367,12 @@ impl Song {
             }
         }
 
+        Ok(Song::from_tracks(tracks, division))
+    }
+
+    /// Builds a song from per-track event lists (with absolute times), merging the tracks into
+    /// playback order and resolving program changes to patch numbers.
+    fn from_tracks(tracks: Vec<Track>, division: u16) -> Song {
         // Construct combined event list sorted by time
         let mut events = Vec::new();
         for track in &tracks {
@@ -368,56 +380,196 @@ impl Song {
         }
         events.sort_by(|a, b| a.time.cmp(&b.time).then(a.track.cmp(&b.track)));
 
-        // Replace bank select events with program select events. Controller events are used to
-        // change the high bits of the program number.
-        let mut program_base = [0u32; 16];
-        let mut program = [0u32; 16];
-        program_base[9] = 0x80;
-        program[9] = 0x80;
-        let mut instruments_used = BTreeSet::new();
+        // Replace program change events with program select events. Bank select controllers
+        // set the high bits of the patch number. Channel 10 (index 9) defaults to bank 1, the
+        // percussion bank.
+        let mut bank = [0u32; 16];
+        bank[9] = 0x80;
         for event in events.iter_mut() {
             match event.event {
                 Event::Controller {
                     channel,
                     controller,
                     value,
-                    ..
                 } => {
                     if controller == 0 {
-                        program_base[channel as usize] =
-                            (program_base[channel as usize] & !(0x7f << 14)) | (value as u32) << 14;
+                        bank[channel as usize] =
+                            (bank[channel as usize] & !(0x7f << 14)) | (value as u32) << 14;
                     } else if controller == 32 {
-                        program_base[channel as usize] =
-                            (program_base[channel as usize] & !(0x7f << 7)) | (value as u32) << 7;
+                        bank[channel as usize] =
+                            (bank[channel as usize] & !(0x7f << 7)) | (value as u32) << 7;
                     }
                 }
-                Event::BankSelect { channel, bank } => {
-                    program[channel as usize] = program_base[channel as usize] | (bank as u32);
+                Event::ProgramChange { channel, program } => {
                     event.event = Event::ProgramSelect {
                         channel,
-                        bank,
-                        program: program[channel as usize],
+                        program,
+                        patch: bank[channel as usize] + program as u32,
                     };
-                }
-                Event::NoteOn { channel, .. } => {
-                    instruments_used.insert(program[channel as usize]);
                 }
                 _ => (),
             }
         }
 
-        // Load all the instruments used in the song
-        let mut instruments = BTreeMap::new();
-        for instrument_idx in instruments_used {
-            instruments.insert(instrument_idx, Instrument::new(data, instrument_idx)?);
-        }
-
-        Ok(Song {
+        Song {
             tracks,
             events,
-            instruments,
             division,
-        })
+        }
+    }
+
+    /// Reads a standard MIDI file, so arbitrary MIDI can be played with the game's
+    /// instruments. Events are interpreted the way the original client's MIDI reader
+    /// does: system exclusive and meta events other than tempo and end of track are skipped.
+    pub fn from_midi_file(data: &[u8]) -> Result<Self> {
+        let mut data = Buffer::new(data.to_vec());
+        if data.get_bytes(4)? != b"MThd" {
+            return Err(anyhow!("Not a MIDI file"));
+        }
+        let header_length = data.get_u32()? as usize;
+        data.seek_absolute(10)?;
+        let track_count = data.get_u16()? as usize;
+        let division = data.get_u16()?;
+        if division & 0x8000 != 0 {
+            return Err(anyhow!("SMPTE time division is not supported"));
+        }
+        data.seek_absolute(8 + header_length)?;
+
+        let mut tracks = Vec::new();
+        while tracks.len() < track_count {
+            let id = data.get_bytes(4)?.to_vec();
+            let length = data.get_u32()? as usize;
+            let chunk = data.get_bytes(length)?.to_vec();
+            if id != b"MTrk" {
+                continue;
+            }
+            let track_index = tracks.len();
+            let mut chunk = Buffer::new(chunk);
+            let mut events = Vec::new();
+            let mut time = 0u32;
+            let mut status = 0u8;
+            loop {
+                time = time
+                    .checked_add(chunk.get_var_int()?)
+                    .ok_or_else(|| anyhow!("Time overflow"))?;
+                if chunk.peek_u8()? & 0x80 != 0 {
+                    status = chunk.get_u8()?;
+                }
+                let channel = status & 0x0f;
+                let event = match status {
+                    0xff => {
+                        let meta_type = chunk.get_u8()?;
+                        let length = chunk.get_var_int()? as usize;
+                        let meta = chunk.get_bytes(length)?;
+                        match meta_type {
+                            0x2f => Some(Event::EndOfTrack),
+                            0x51 if length >= 3 => Some(Event::TempoChange(u32::from_be_bytes([
+                                0, meta[0], meta[1], meta[2],
+                            ]))),
+                            _ => None,
+                        }
+                    }
+                    0xf0 | 0xf7 => {
+                        let length = chunk.get_var_int()? as usize;
+                        chunk.get_bytes(length)?;
+                        None
+                    }
+                    0x80..=0x8f => Some(Event::NoteOff {
+                        channel,
+                        note: chunk.get_u8()? & 0x7f,
+                        velocity: chunk.get_u8()? & 0x7f,
+                    }),
+                    0x90..=0x9f => Some(Event::NoteOn {
+                        channel,
+                        note: chunk.get_u8()? & 0x7f,
+                        velocity: chunk.get_u8()? & 0x7f,
+                    }),
+                    0xa0..=0xaf => Some(Event::KeyPressure {
+                        channel,
+                        note: chunk.get_u8()? & 0x7f,
+                        pressure: chunk.get_u8()? & 0x7f,
+                    }),
+                    0xb0..=0xbf => Some(Event::Controller {
+                        channel,
+                        controller: chunk.get_u8()? & 0x7f,
+                        value: chunk.get_u8()? & 0x7f,
+                    }),
+                    0xc0..=0xcf => Some(Event::ProgramChange {
+                        channel,
+                        program: chunk.get_u8()? & 0x7f,
+                    }),
+                    0xd0..=0xdf => Some(Event::ChannelPressure {
+                        channel,
+                        pressure: chunk.get_u8()? & 0x7f,
+                    }),
+                    0xe0..=0xef => {
+                        let lsb = (chunk.get_u8()? & 0x7f) as u16;
+                        let msb = (chunk.get_u8()? & 0x7f) as u16;
+                        Some(Event::PitchWheel {
+                            channel,
+                            position: (msb << 7) | lsb,
+                        })
+                    }
+                    // Other system messages carry 0-2 data bytes and are ignored.
+                    0xf1 | 0xf3 => {
+                        chunk.get_u8()?;
+                        None
+                    }
+                    0xf2 => {
+                        chunk.get_bytes(2)?;
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let end = matches!(event, Event::EndOfTrack);
+                    events.push(TrackEvent {
+                        track: track_index,
+                        time,
+                        event,
+                    });
+                    if end {
+                        break;
+                    }
+                }
+                if chunk.at_end() {
+                    return Err(anyhow!(
+                        "MIDI track {} has no end of track event",
+                        track_index
+                    ));
+                }
+            }
+            tracks.push(Track { events });
+        }
+
+        Ok(Song::from_tracks(tracks, division))
+    }
+
+    /// Determines which keys of which patches the song plays, so only the samples that are
+    /// needed get loaded. Returns a map from patch number to the keys used.
+    pub fn patch_usage(&self) -> BTreeMap<u32, [bool; 128]> {
+        let mut usage = BTreeMap::new();
+        let mut patch = [0u32; 16];
+        patch[9] = 0x80;
+        for event in &self.events {
+            match event.event {
+                Event::ProgramSelect {
+                    channel,
+                    patch: selected,
+                    ..
+                } => patch[channel as usize] = selected,
+                Event::NoteOn {
+                    channel,
+                    note,
+                    velocity,
+                } if velocity > 0 => {
+                    usage.entry(patch[channel as usize]).or_insert([false; 128])[note as usize] =
+                        true;
+                }
+                _ => (),
+            }
+        }
+        usage
     }
 
     fn track_midi(&self, track: &Track) -> Result<Vec<u8>> {
@@ -493,13 +645,12 @@ impl Song {
                     out.write_u8(note);
                     out.write_u8(pressure);
                 }
-                Event::BankSelect { channel, bank } => {
+                Event::ProgramChange { channel, program }
+                | Event::ProgramSelect {
+                    channel, program, ..
+                } => {
                     out.write_u8(0xc0 | channel);
-                    out.write_u8(bank);
-                }
-                Event::ProgramSelect { channel, bank, .. } => {
-                    out.write_u8(0xc0 | channel);
-                    out.write_u8(bank);
+                    out.write_u8(program);
                 }
             }
         }
@@ -537,7 +688,7 @@ impl Song {
         let mut skip_count = 1;
         let mut first_track_events: Vec<_> = self
             .tracks
-            .get(0)
+            .first()
             .ok_or_else(|| anyhow!("No tracks found"))?
             .events
             .iter()

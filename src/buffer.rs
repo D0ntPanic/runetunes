@@ -22,6 +22,11 @@ impl Buffer {
         }
     }
 
+    /// Returns the current position in the buffer
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// Seeks to an absolute offset
     pub fn seek_absolute(&mut self, offset: usize) -> Result<()> {
         if offset > self.data.len() {
@@ -94,6 +99,10 @@ impl Buffer {
         self.data.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Determines if the current position is at the end of the buffer
     pub fn at_end(&self) -> bool {
         self.offset == self.data.len()
@@ -112,12 +121,11 @@ impl Buffer {
 
     /// Gets the specified range of bytes from the data
     pub fn get_at(&self, offset: usize, size: usize) -> Result<&[u8]> {
-        if offset > self.data.len() {
-            Err(anyhow!("Data beyond end of buffer"))
-        } else if offset
-            .checked_add(size)
-            .ok_or_else(|| anyhow!("Invalid size"))?
-            > self.data.len()
+        if offset > self.data.len()
+            || offset
+                .checked_add(size)
+                .ok_or_else(|| anyhow!("Invalid size"))?
+                > self.data.len()
         {
             Err(anyhow!("Data beyond end of buffer"))
         } else {
@@ -192,17 +200,92 @@ impl Buffer {
         Ok(result)
     }
 
-    /// Reads a null-terminated string from the buffer
+    /// Returns the next byte without advancing the position
+    pub fn peek_u8(&self) -> Result<u8> {
+        self.data
+            .get(self.offset)
+            .copied()
+            .ok_or_else(|| anyhow!("Not enough bytes remaining in buffer"))
+    }
+
+    /// Reads an unsigned "smart" integer: one byte for values 0..128, otherwise two bytes with
+    /// the top bit set (values 0..32768).
+    pub fn get_unsigned_smart(&mut self) -> Result<i32> {
+        if self.peek_u8()? < 128 {
+            Ok(self.get_u8()? as i32)
+        } else {
+            Ok(self.get_u16()? as i32 - 0x8000)
+        }
+    }
+
+    /// Reads a signed "smart" integer: one byte for values -64..64, otherwise two bytes with the
+    /// top bit set (values -16384..16384).
+    pub fn get_signed_smart(&mut self) -> Result<i32> {
+        if self.peek_u8()? < 128 {
+            Ok(self.get_u8()? as i32 - 64)
+        } else {
+            Ok(self.get_u16()? as i32 - 0xc000)
+        }
+    }
+
+    /// Reads a "big smart" integer: two bytes for values 0..32768, otherwise four bytes with the
+    /// top bit set (used for IDs in version 7 archive indexes).
+    pub fn get_big_smart(&mut self) -> Result<u32> {
+        if self.peek_u8()? < 128 {
+            Ok(self.get_u16()? as u32)
+        } else {
+            Ok(self.get_u32()? & 0x7fff_ffff)
+        }
+    }
+
+    /// Reads a variable length integer stored least significant group first, seven bits per
+    /// byte with the top bit marking continuation.
+    pub fn get_var_int_le(&mut self) -> Result<u32> {
+        let mut result = 0u32;
+        let mut shift = 0;
+        loop {
+            let byte = self.get_u8()?;
+            result |= ((byte & 0x7f) as u32) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        Ok(result)
+    }
+
+    /// Reads a null-terminated string from the buffer. The game encodes strings in Windows-1252.
     pub fn get_string(&mut self) -> Result<String> {
-        let mut chars = Vec::new();
+        let mut string = String::new();
         loop {
             let ch = self.get_u8()?;
             if ch == 0 {
                 break;
             }
-            chars.push(ch);
+            string.push(cp1252_char(ch));
         }
-        Ok(String::from_utf8(chars)?)
+        Ok(string)
+    }
+}
+
+/// Decodes a Windows-1252 byte. Undefined positions map to the C1 control of the same value.
+fn cp1252_char(byte: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}',
+        '\u{8f}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}',
+        '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}',
+        '\u{178}',
+    ];
+    match byte {
+        0x80..=0x9f => HIGH[(byte - 0x80) as usize],
+        _ => byte as char,
+    }
+}
+
+impl Default for OutputBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -249,7 +332,6 @@ impl OutputBuffer {
 
     pub fn write_var_int(&mut self, mut value: u32) {
         let mut bytes = Vec::new();
-        let orig_value = value;
         loop {
             bytes.push((value & 0x7f) as u8);
             value >>= 7;
