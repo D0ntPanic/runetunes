@@ -3,6 +3,7 @@ pub mod audio;
 pub mod buffer;
 pub mod cache;
 pub mod data;
+pub mod shuffle;
 pub mod song;
 pub mod wav;
 
@@ -13,6 +14,7 @@ use audio::{Engine, PlaybackOptions};
 use cache::Cache;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use data::{song_list, Data};
+use shuffle::ShuffleQueue;
 use song::Song;
 use std::collections::HashSet;
 use std::io::Write;
@@ -100,6 +102,15 @@ enum Command {
         /// Song name (case-insensitive), song group ID in archive 6, or a path to a standard
         /// MIDI file to play with the game's instruments
         song: String,
+        #[command(flatten)]
+        playback: PlaybackArgs,
+    },
+    /// Play the songs listed in a file in shuffled order until interrupted. A song does not
+    /// repeat until at least a third of the list has played.
+    Shuffle {
+        /// File listing one song per line, by name (case-insensitive) or group ID. Blank lines
+        /// are ignored.
+        playlist: PathBuf,
         #[command(flatten)]
         playback: PlaybackArgs,
     },
@@ -200,6 +211,12 @@ fn main() -> Result<()> {
             let renderer = MusicRenderer::for_song(&data, &song, &playback.options(data.engine))?;
             audio::device::play(renderer)
         }
+        Command::Shuffle { playlist, playback } => {
+            if playback.looping {
+                return Err(anyhow!("--loop can't be used with shuffle"));
+            }
+            shuffle(&data, &playlist, &playback.options(data.engine))
+        }
         Command::DumpSamples {
             source,
             output,
@@ -216,9 +233,18 @@ fn main() -> Result<()> {
                 Engine::Enhanced => "enhanced",
             };
             if capture {
-                render_all(&data, &playback.options(data.engine), true, &dir.join(engine_name))
+                render_all(
+                    &data,
+                    &playback.options(data.engine),
+                    true,
+                    &dir.join(engine_name),
+                )
             } else {
-                validate_all(&data, &playback.options(data.engine), &dir.join(engine_name))
+                validate_all(
+                    &data,
+                    &playback.options(data.engine),
+                    &dir.join(engine_name),
+                )
             }
         }
     }
@@ -235,14 +261,16 @@ fn load_song(data: &Data, query: &str) -> Result<(Song, String)> {
             .unwrap_or_else(|| query.to_string());
         return Ok((song, name));
     }
-    let (group, name) = find_song(data, query)?;
+    let (group, name) = find_song(data, &song_list(data), query)?;
     Ok((Song::new(data, group)?, name))
 }
 
-/// Looks up a song by group ID or name.
-fn find_song(data: &Data, query: &str) -> Result<(u32, String)> {
-    let songs = song_list(data);
+/// Looks up a song by group ID or name in `songs` (from [`song_list`]).
+fn find_song(data: &Data, songs: &[(u32, String)], query: &str) -> Result<(u32, String)> {
     if let Ok(group) = query.parse::<u32>() {
+        if data.song_archive.file_capacity(group as usize) == 0 {
+            return Err(anyhow!("No song with group ID {}", group));
+        }
         let name = songs
             .iter()
             .find(|(id, _)| *id == group)
@@ -251,9 +279,68 @@ fn find_song(data: &Data, query: &str) -> Result<(u32, String)> {
         return Ok((group, name));
     }
     songs
-        .into_iter()
+        .iter()
         .find(|(_, name)| name.eq_ignore_ascii_case(query))
+        .cloned()
         .ok_or_else(|| anyhow!("No song named \"{}\" (use the list command)", query))
+}
+
+/// Plays the songs listed in a playlist file (see [`Command::Shuffle`]) in shuffled order
+/// until interrupted.
+fn shuffle(data: &Data, playlist: &Path, options: &PlaybackOptions) -> Result<()> {
+    // Look up every song first so that mistakes are reported before playback starts.
+    let contents = std::fs::read_to_string(playlist)
+        .map_err(|error| anyhow!("Can't read {}: {}", playlist.display(), error))?;
+    let all_songs = song_list(data);
+    let mut songs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut errors = 0;
+    for (line, query) in contents.lines().enumerate() {
+        let query = query.trim();
+        if query.is_empty() {
+            continue;
+        }
+        match find_song(data, &all_songs, query) {
+            Ok(song) => {
+                if seen.insert(song.0) {
+                    songs.push(song);
+                }
+            }
+            Err(error) => {
+                eprintln!("{}:{}: {}", playlist.display(), line + 1, error);
+                errors += 1;
+            }
+        }
+    }
+    if errors > 0 {
+        return Err(anyhow!(
+            "{} song(s) in {} not found",
+            errors,
+            playlist.display()
+        ));
+    }
+    if songs.is_empty() {
+        return Err(anyhow!("{} lists no songs", playlist.display()));
+    }
+
+    println!("Shuffling {} songs (Ctrl-C to stop)", songs.len());
+    let channels = if options.stereo { 2 } else { 1 };
+    let mut player = audio::device::Player::new(options.sample_rate as u32, channels)?;
+    let mut queue = ShuffleQueue::new(songs, rand::rng());
+    while let Some((group, name)) = queue.pop() {
+        let renderer =
+            Song::new(data, group).and_then(|song| MusicRenderer::for_song(data, &song, options));
+        match renderer {
+            Ok(mut renderer) => {
+                println!("Playing \"{}\"", name);
+                player.play(&mut renderer);
+                queue.played((group, name));
+            }
+            // Leave it out of the rotation.
+            Err(error) => eprintln!("Can't play \"{}\": {:#}", name, error),
+        }
+    }
+    Err(anyhow!("None of the songs could be played"))
 }
 
 /// Renders a song to a WAV file, or to raw 32-bit mix data.

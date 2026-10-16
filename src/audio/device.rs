@@ -16,102 +16,147 @@ const BUFFER_SECONDS: f64 = 0.2;
 const TAIL_SECONDS: f64 = 1.0;
 
 /// Plays a renderer on the default output device until the song ends.
+pub fn play(mut renderer: MusicRenderer) -> Result<()> {
+    let mut player = Player::new(renderer.sample_rate() as u32, renderer.channels())?;
+    player.play(&mut renderer);
+    player.finish();
+    Ok(())
+}
+
+/// An output stream on the default device that plays renderers one after another.
 ///
-/// The renderer stays on the calling thread (it is not `Send`) and fills a small ring buffer
+/// Renderers stay on the calling thread (they are not `Send`) and fill a small ring buffer
 /// that the device callback drains. If the device does not support the synthesizer's sample
 /// rate, which is likely for the default 22050 Hz, the output is resampled to the device rate.
-pub fn play(mut renderer: MusicRenderer) -> Result<()> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("No audio output device found"))?;
+pub struct Player {
+    /// Kept alive so the device keeps playing.
+    _stream: cpal::Stream,
+    buffer: Arc<Mutex<VecDeque<f32>>>,
+    underrun: Arc<AtomicBool>,
+    resampler: Resampler,
+    source_rate: u32,
+    source_channels: usize,
+    device_channels: usize,
+    /// Maximum number of samples queued in `buffer`.
+    capacity: usize,
+    converted: Vec<f32>,
+    resampled: Vec<f32>,
+}
 
-    let source_rate = renderer.sample_rate() as u32;
-    let source_channels = renderer.channels();
+impl Player {
+    /// Opens the default output device for audio rendered at `source_rate` Hz with
+    /// `source_channels` channels.
+    pub fn new(source_rate: u32, source_channels: usize) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("No audio output device found"))?;
 
-    // Prefer a configuration at the synth's own rate so no resampling is needed.
-    let native = device.supported_output_configs()?.find_map(|range| {
-        if range.channels() as usize >= source_channels
-            && matches!(range.sample_format(), SampleFormat::F32 | SampleFormat::I16)
-        {
-            range.try_with_sample_rate(source_rate)
-        } else {
-            None
-        }
-    });
-    let config = match native {
-        Some(config) => config,
-        None => device.default_output_config()?,
-    };
-    let format = config.sample_format();
-    let config: StreamConfig = config.into();
-
-    let buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-    let underrun = Arc::new(AtomicBool::new(false));
-    let stream = match format {
-        SampleFormat::F32 => build_stream::<f32>(&device, &config, &buffer, &underrun)?,
-        SampleFormat::I16 => build_stream::<i16>(&device, &config, &buffer, &underrun)?,
-        SampleFormat::I32 => build_stream::<i32>(&device, &config, &buffer, &underrun)?,
-        SampleFormat::U16 => build_stream::<u16>(&device, &config, &buffer, &underrun)?,
-        SampleFormat::F64 => build_stream::<f64>(&device, &config, &buffer, &underrun)?,
-        format => return Err(anyhow!("Unsupported device sample format {}", format)),
-    };
-    stream.play()?;
-
-    let device_rate = config.sample_rate;
-    let device_channels = config.channels as usize;
-    let mut resampler = Resampler::new(source_rate, device_rate, source_channels);
-    let capacity = (BUFFER_SECONDS * device_rate as f64) as usize * device_channels;
-    let chunk_seconds = renderer.chunk_frames() as f64 / source_rate as f64;
-    let mut tail_chunks = (TAIL_SECONDS / chunk_seconds).ceil() as u32;
-    let mut converted = Vec::new();
-    let mut resampled = Vec::new();
-
-    while tail_chunks > 0 {
-        if !renderer.synth.is_active() {
-            tail_chunks -= 1;
-        }
-        converted.clear();
-        converted.extend(
-            renderer
-                .render_chunk()
-                .iter()
-                .map(|&sample| to_i16(sample) as f32 / 32768.0),
-        );
-        resampled.clear();
-        resampler.process(&converted, &mut resampled);
-
-        // Wait for room in the device buffer, then queue the frames, mapping channels.
-        loop {
-            let queued = buffer.lock().unwrap().len();
-            if queued + resampled.len() / source_channels * device_channels <= capacity.max(1) {
-                break;
+        // Prefer a configuration at the synth's own rate so no resampling is needed.
+        let native = device.supported_output_configs()?.find_map(|range| {
+            if range.channels() as usize >= source_channels
+                && matches!(range.sample_format(), SampleFormat::F32 | SampleFormat::I16)
+            {
+                range.try_with_sample_rate(source_rate)
+            } else {
+                None
             }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let mut queue = buffer.lock().unwrap();
-        for frame in resampled.chunks(source_channels) {
-            for channel in 0..device_channels {
-                queue.push_back(if source_channels == 1 {
-                    frame[0]
-                } else if channel < source_channels {
-                    frame[channel]
-                } else {
-                    0.0
-                });
+        });
+        let config = match native {
+            Some(config) => config,
+            None => device.default_output_config()?,
+        };
+        let format = config.sample_format();
+        let config: StreamConfig = config.into();
+
+        let buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let underrun = Arc::new(AtomicBool::new(false));
+        let stream = match format {
+            SampleFormat::F32 => build_stream::<f32>(&device, &config, &buffer, &underrun)?,
+            SampleFormat::I16 => build_stream::<i16>(&device, &config, &buffer, &underrun)?,
+            SampleFormat::I32 => build_stream::<i32>(&device, &config, &buffer, &underrun)?,
+            SampleFormat::U16 => build_stream::<u16>(&device, &config, &buffer, &underrun)?,
+            SampleFormat::F64 => build_stream::<f64>(&device, &config, &buffer, &underrun)?,
+            format => return Err(anyhow!("Unsupported device sample format {}", format)),
+        };
+        stream.play()?;
+
+        let device_rate = config.sample_rate;
+        let device_channels = config.channels as usize;
+        Ok(Player {
+            _stream: stream,
+            buffer,
+            underrun,
+            resampler: Resampler::new(source_rate, device_rate, source_channels),
+            source_rate,
+            source_channels,
+            device_channels,
+            capacity: (BUFFER_SECONDS * device_rate as f64) as usize * device_channels,
+            converted: Vec::new(),
+            resampled: Vec::new(),
+        })
+    }
+
+    /// Plays a renderer until its song ends, followed by a second of silence. Returns once the
+    /// last of it is queued, so a following renderer plays without a break.
+    pub fn play(&mut self, renderer: &mut MusicRenderer) {
+        assert_eq!(renderer.sample_rate() as u32, self.source_rate);
+        assert_eq!(renderer.channels(), self.source_channels);
+
+        // Running dry before this song started (e.g. while it was loading) is not a problem.
+        self.underrun.store(false, Ordering::Relaxed);
+        let chunk_seconds = renderer.chunk_frames() as f64 / self.source_rate as f64;
+        let mut tail_chunks = (TAIL_SECONDS / chunk_seconds).ceil() as u32;
+
+        while tail_chunks > 0 {
+            if !renderer.synth.is_active() {
+                tail_chunks -= 1;
             }
+            self.converted.clear();
+            self.converted.extend(
+                renderer
+                    .render_chunk()
+                    .iter()
+                    .map(|&sample| to_i16(sample) as f32 / 32768.0),
+            );
+            self.resampled.clear();
+            self.resampler.process(&self.converted, &mut self.resampled);
+
+            // Wait for room in the device buffer, then queue the frames, mapping channels.
+            let frames = self.resampled.len() / self.source_channels;
+            loop {
+                let queued = self.buffer.lock().unwrap().len();
+                if queued + frames * self.device_channels <= self.capacity.max(1) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut queue = self.buffer.lock().unwrap();
+            for frame in self.resampled.chunks(self.source_channels) {
+                for channel in 0..self.device_channels {
+                    queue.push_back(if self.source_channels == 1 {
+                        frame[0]
+                    } else if channel < self.source_channels {
+                        frame[channel]
+                    } else {
+                        0.0
+                    });
+                }
+            }
+        }
+
+        if self.underrun.load(Ordering::Relaxed) {
+            eprintln!("Warning: audio output underran (the renderer could not keep up)");
         }
     }
 
-    // Let the device drain what is queued.
-    while !buffer.lock().unwrap().is_empty() {
-        std::thread::sleep(Duration::from_millis(10));
+    /// Waits for the device to play everything queued.
+    pub fn finish(self) {
+        while !self.buffer.lock().unwrap().is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    std::thread::sleep(Duration::from_millis(100));
-    if underrun.load(Ordering::Relaxed) {
-        eprintln!("Warning: audio output underran (the renderer could not keep up)");
-    }
-    Ok(())
 }
 
 fn build_stream<T>(

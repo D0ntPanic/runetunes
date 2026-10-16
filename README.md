@@ -14,6 +14,7 @@ output has been verified to be bit-identical to the original Java code of both c
 ```sh
 runetunes CACHE play "Harmony"       # play on the default audio device
 runetunes CACHE play my_song.mid     # play any MIDI file with the game's instruments
+runetunes CACHE shuffle songs.txt    # play the songs listed in a file, shuffled, until Ctrl-C
 runetunes CACHE extract              # export every song as MIDI (+ raw patch files) to ./output
 runetunes CACHE extract -o DIR       # same, to DIR
 runetunes CACHE list                 # list songs with their group IDs
@@ -22,6 +23,10 @@ runetunes CACHE render 42 -o out.wav # songs can also be selected by group ID
 ```
 
 `CACHE` is the cache directory containing `main_file_cache.dat2` and the `.idx` files.
+
+A `shuffle` playlist lists one song per line, by name or group ID; blank lines are ignored.
+Each song plays once in a random order, and after that the order keeps reshuffling, but a song
+never comes up again until at least a third of the list has played in between.
 The engine version is detected from the cache. `--engine build530` or `--engine osrs`
 overrides the engine version.
 
