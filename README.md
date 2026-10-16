@@ -9,6 +9,17 @@ client's synthesizer. Both versions of the engine are supported: Old School's de
 2007 snapshot of the same code and was later reworked for 16-bit audio. The implementation's
 output has been verified to be bit-identical to the original Java code of both clients.
 
+## Installation
+
+This program requires a valid Rust toolchain. If you do not have one, you can get one from
+the [official Rust site](https://rust-lang.org/).
+
+To install, run the following command from the root of this repository:
+
+```sh
+cargo install --locked --path .
+```
+
 ## Usage
 
 ```sh
@@ -27,6 +38,7 @@ runetunes CACHE render 42 -o out.wav # songs can also be selected by group ID
 A `shuffle` playlist lists one song per line, by name or group ID; blank lines are ignored.
 Each song plays once in a random order, and after that the order keeps reshuffling, but a song
 never comes up again until at least a third of the list has played in between.
+
 The engine version is detected from the cache. `--engine build530` or `--engine osrs`
 overrides the engine version.
 
@@ -46,5 +58,5 @@ Rendering and playback options:
 | `--seconds N` | whole song | `render` only: length to render |
 | `--tail N` | 1 | `render` only: seconds of silence after the song ends |
 
-Many songs do not sound as you'd expect with a non-default sample rate, but the results match
-the original implementation.
+If using the default engine that mirrors the original, many songs do not sound as you'd
+expect with a non-default sample rate, but the results match the original implementation.
