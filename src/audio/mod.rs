@@ -72,6 +72,8 @@ pub enum Engine {
     Build530,
     /// Old School RuneScape.
     Osrs,
+    /// Enhanced engine with higher default sample rate and better resampling.
+    Enhanced,
 }
 
 impl Engine {
@@ -79,21 +81,21 @@ impl Engine {
     pub fn chunk_frames(self) -> usize {
         match self {
             Engine::Build530 => 256,
-            Engine::Osrs => 512,
+            Engine::Osrs | Engine::Enhanced => 512,
         }
     }
 
     /// Whether instrument samples are 16-bit (otherwise 8-bit values are stored in the same
     /// 16-bit containers).
     pub fn sixteen_bit_samples(self) -> bool {
-        self == Engine::Osrs
+        self != Engine::Build530
     }
 
     /// Rate synth sounds are rendered at for a given output rate.
     pub fn synth_sample_rate(self, output_rate: i32) -> i32 {
         match self {
             Engine::Build530 => output_rate,
-            Engine::Osrs => 22050,
+            Engine::Osrs | Engine::Enhanced => 22050,
         }
     }
 
@@ -102,12 +104,12 @@ impl Engine {
     /// loud and mostly clipped. This differs from that implementation so that mono mode can
     /// actually be used.
     pub fn wide_mixing(self) -> bool {
-        self == Engine::Osrs
+        self != Engine::Build530
     }
 
     /// Whether a note ends once its exponential decay has run its course.
     pub fn decay_ends_notes(self) -> bool {
-        self == Engine::Build530
+        self != Engine::Osrs
     }
 
     /// Number of streams above the note list in the stream tree, each of which scales voice
@@ -117,7 +119,27 @@ impl Engine {
             // AudioChannel -> MidiPcmStream -> MidiNoteStream
             Engine::Build530 => 1,
             // PcmPlayer -> PcmStreamMixer -> MidiPcmStream -> MusicPatchPcmStream
-            Engine::Osrs => 2,
+            Engine::Osrs | Engine::Enhanced => 2,
+        }
+    }
+
+    /// Fractional bits of voice playback positions and steps. The original clients use 24.8
+    /// fixed point, which is only accurate near their 22050 Hz output rate: a step plays a
+    /// 22050 Hz sample at about 59 at 96 kHz, so rounding it detunes notes by up to ~15 cents
+    /// and quantizes vibrato and glides into audible steps.
+    pub fn position_frac_bits(self) -> u32 {
+        match self {
+            Engine::Build530 | Engine::Osrs => 8,
+            Engine::Enhanced => 32,
+        }
+    }
+
+    /// Default sample rate. For original engines, this is 22050 Hz. For the enhanced
+    /// engine, this is 48000 Hz.
+    pub fn default_sample_rate(self) -> i32 {
+        match self {
+            Engine::Enhanced => 48000,
+            _ => 22050,
         }
     }
 }

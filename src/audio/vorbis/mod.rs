@@ -516,12 +516,12 @@ fn inverse_mdct(v: &mut [f32], n: usize, tables: &ImdctTables, engine: Engine) {
         let i = c * (e + g) - b * (d - f);
         // Float addition isn't associative, and the two clients add these terms in different
         // orders.
-        if engine == Engine::Osrs {
-            v[n2 + l * 2 + 1] = (e - g + i) * 0.5f32;
-            v[n - l * 2 - 1] = (-e + g + i) * 0.5f32;
-        } else {
+        if engine == Engine::Build530 {
             v[n2 + l * 2 + 1] = (e + i - g) * 0.5f32;
             v[n - l * 2 - 1] = (g + i - e) * 0.5f32;
+        } else {
+            v[n2 + l * 2 + 1] = (e - g + i) * 0.5f32;
+            v[n - l * 2 - 1] = (-e + g + i) * 0.5f32;
         }
     }
 

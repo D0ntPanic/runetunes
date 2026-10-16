@@ -14,8 +14,9 @@ pub const PAN_CENTER: i32 = 8192;
 ///
 /// # Fixed-point conventions
 ///
-/// * `position` is in 1/256 sample units (24.8 fixed point). A negative `step` plays the
-///   sample backwards.
+/// * `position` and `step` are fixed point with `frac_bits` fractional bits (see
+///   [`Engine::position_frac_bits`]). The original clients use 24.8 fixed point, so one unit
+///   is 1/256 of a sample. A negative `step` plays the sample backwards.
 /// * With 8-bit samples a voice adds `(sample << 8) * volume >> 6` (that is,
 ///   `4 * sample * volume`) to the mix, and the output stage divides the mix by 256 to produce
 ///   16-bit audio. A volume of 16384 therefore plays a full-scale 8-bit sample at full 16-bit
@@ -23,6 +24,8 @@ pub const PAN_CENTER: i32 = 8192;
 ///   samples; see [`MixFormat`].
 /// * Volume and pan changes are applied as linear ramps over a number of samples, tracked
 ///   separately for the mono volume and the left/right volumes.
+///
+/// [`Engine::position_frac_bits`]: super::Engine::position_frac_bits
 #[derive(Debug, Clone)]
 pub struct SampleVoice {
     pub sample: Rc<Sample>,
@@ -32,10 +35,12 @@ pub struct SampleVoice {
     /// Whether looping alternates direction.
     ping_pong: bool,
 
-    /// Playback position, 24.8 fixed point.
-    position: i32,
-    /// Position increment per output sample, 24.8 fixed point; negative when playing backwards.
-    step: i32,
+    /// Fractional bits of `position` and `step`.
+    frac_bits: u32,
+    /// Playback position, fixed point.
+    position: i64,
+    /// Position increment per output sample, fixed point; negative when playing backwards.
+    step: i64,
     /// Loop passes remaining: 0 = don't loop, -1 = loop forever.
     loops_remaining: i32,
 
@@ -98,13 +103,15 @@ pub struct MixFormat {
 }
 
 impl MixFormat {
-    /// Interpolates between two samples at `fraction` (0..256) of the way from `from` to `to`.
+    /// Interpolates between two samples at `fraction` (0..2^`frac_bits`) of the way from
+    /// `from` to `to`.
     #[inline(always)]
-    fn interpolate(&self, from: i32, to: i32, fraction: i32) -> i32 {
+    fn interpolate(&self, from: i32, to: i32, fraction: i64, frac_bits: u32) -> i32 {
+        let delta = (to - from) as i64 * fraction;
         if self.wide {
-            from + (((to - from) * fraction) >> 8)
+            from + (delta >> frac_bits) as i32
         } else {
-            (from << 8) + (to - from) * fraction
+            (from << 8) + (delta >> (frac_bits - 8)) as i32
         }
     }
 
@@ -136,8 +143,15 @@ struct Mix<'a> {
 }
 
 impl SampleVoice {
-    /// Starts a voice at the beginning of `sample`. Returns `None` for an empty sample.
-    pub fn new(sample: Rc<Sample>, step: i32, volume: i32, pan: i32) -> Option<Self> {
+    /// Starts a voice at the beginning of `sample`, with `step` given in fixed point with
+    /// `frac_bits` fractional bits. Returns `None` for an empty sample.
+    pub fn new(
+        sample: Rc<Sample>,
+        frac_bits: u32,
+        step: i64,
+        volume: i32,
+        pan: i32,
+    ) -> Option<Self> {
         if sample.data.is_empty() {
             return None;
         }
@@ -146,6 +160,7 @@ impl SampleVoice {
             loop_end: sample.loop_end,
             ping_pong: sample.ping_pong,
             sample,
+            frac_bits,
             position: 0,
             step,
             loops_remaining: 0,
@@ -174,13 +189,18 @@ impl SampleVoice {
         self.loops_remaining = loops;
     }
 
+    /// Fractional bits of the voice's position and step.
+    pub fn frac_bits(&self) -> u32 {
+        self.frac_bits
+    }
+
     /// Current playback rate (always positive).
-    pub fn rate(&self) -> i32 {
+    pub fn rate(&self) -> i64 {
         self.step.abs()
     }
 
     /// Sets the playback rate, keeping the current direction.
-    pub fn set_rate(&mut self, rate: i32) {
+    pub fn set_rate(&mut self, rate: i64) {
         self.step = if self.step < 0 { -rate } else { rate };
     }
 
@@ -189,15 +209,19 @@ impl SampleVoice {
         self.step = -self.step.abs();
     }
 
-    /// Moves the playback position (24.8 fixed point), clamped to just outside the sample.
-    pub fn set_position(&mut self, position: i32) {
-        let end = self.sample.len() << 8;
-        self.position = position.clamp(-1, end);
+    /// Length of the sample in position units.
+    fn fixed_length(&self) -> i64 {
+        (self.sample.len() as i64) << self.frac_bits
+    }
+
+    /// Moves the playback position (fixed point), clamped to just outside the sample.
+    pub fn set_position(&mut self, position: i64) {
+        self.position = position.clamp(-1, self.fixed_length());
     }
 
     /// Whether the position has run off either end of the sample.
     pub fn is_finished(&self) -> bool {
-        self.position < 0 || self.position >= self.sample.len() << 8
+        self.position < 0 || self.position >= self.fixed_length()
     }
 
     /// Whether a volume ramp is in progress.
@@ -234,7 +258,9 @@ impl SampleVoice {
     pub fn priority(&self) -> i32 {
         let mut priority = (self.volume.wrapping_mul(3) >> 6).wrapping_abs();
         if self.loops_remaining == 0 {
-            priority -= (priority.wrapping_mul(self.position)) / (self.sample.len() << 8);
+            // In 24.8 units, overflowing like the original client.
+            let position = (self.position >> (self.frac_bits - 8)) as i32;
+            priority -= (priority.wrapping_mul(position)) / (self.sample.len() << 8);
         } else if self.loops_remaining >= 0 {
             priority -= priority.wrapping_mul(self.loop_start) / self.sample.len();
         }
@@ -404,9 +430,9 @@ impl SampleVoice {
         }
         let sample = self.sample.clone();
         let data = &sample.data[..];
-        let start = self.loop_start << 8;
-        let end = self.loop_end << 8;
-        let length = sample.len() << 8;
+        let start = (self.loop_start as i64) << self.frac_bits;
+        let end = (self.loop_end as i64) << self.frac_bits;
+        let length = self.fixed_length();
         let loop_length = end - start;
         if loop_length <= 0 {
             self.loops_remaining = 0;
@@ -486,13 +512,13 @@ impl SampleVoice {
                             return;
                         }
                         let wraps = (end - self.position - 1) / loop_length;
-                        if wraps >= self.loops_remaining {
-                            self.position += loop_length * self.loops_remaining;
+                        if wraps >= self.loops_remaining as i64 {
+                            self.position += loop_length * self.loops_remaining as i64;
                             self.loops_remaining = 0;
                             break;
                         }
                         self.position += loop_length * wraps;
-                        self.loops_remaining -= wraps;
+                        self.loops_remaining -= wraps as i32;
                     }
                 } else {
                     loop {
@@ -501,13 +527,13 @@ impl SampleVoice {
                             return;
                         }
                         let wraps = (self.position - start) / loop_length;
-                        if wraps >= self.loops_remaining {
-                            self.position -= loop_length * self.loops_remaining;
+                        if wraps >= self.loops_remaining as i64 {
+                            self.position -= loop_length * self.loops_remaining as i64;
                             self.loops_remaining = 0;
                             break;
                         }
                         self.position -= loop_length * wraps;
-                        self.loops_remaining -= wraps;
+                        self.loops_remaining -= wraps as i32;
                     }
                 }
             }
@@ -592,9 +618,9 @@ impl SampleVoice {
             }
         }
 
-        let start = self.loop_start << 8;
-        let end = self.loop_end << 8;
-        let length = self.sample.len() << 8;
+        let start = (self.loop_start as i64) << self.frac_bits;
+        let end = (self.loop_end as i64) << self.frac_bits;
+        let length = self.fixed_length();
         let loop_length = end - start;
         if loop_length <= 0 {
             self.loops_remaining = 0;
@@ -616,7 +642,9 @@ impl SampleVoice {
             self.position = length - 1;
         }
 
-        self.position = self.position.wrapping_add(self.step.wrapping_mul(count));
+        self.position = self
+            .position
+            .wrapping_add(self.step.wrapping_mul(count as i64));
         if self.loops_remaining >= 0 {
             if self.loops_remaining > 0 {
                 if self.ping_pong {
@@ -658,24 +686,24 @@ impl SampleVoice {
                         return;
                     }
                     let wraps = (end - self.position - 1) / loop_length;
-                    if wraps < self.loops_remaining {
+                    if wraps < self.loops_remaining as i64 {
                         self.position += loop_length * wraps;
-                        self.loops_remaining -= wraps;
+                        self.loops_remaining -= wraps as i32;
                         return;
                     }
-                    self.position += loop_length * self.loops_remaining;
+                    self.position += loop_length * self.loops_remaining as i64;
                     self.loops_remaining = 0;
                 } else {
                     if self.position < end {
                         return;
                     }
                     let wraps = (self.position - start) / loop_length;
-                    if wraps < self.loops_remaining {
+                    if wraps < self.loops_remaining as i64 {
                         self.position -= loop_length * wraps;
-                        self.loops_remaining -= wraps;
+                        self.loops_remaining -= wraps as i32;
                         return;
                     }
-                    self.position -= loop_length * self.loops_remaining;
+                    self.position -= loop_length * self.loops_remaining as i64;
                     self.loops_remaining = 0;
                 }
             }
@@ -716,15 +744,15 @@ impl SampleVoice {
         }
     }
 
-    /// Mixes forwards from frame `frame` until the position reaches `end` (24.8) or the output
-    /// reaches `out_end`, handling any ramp in progress. `next_value` is the sample used to
-    /// interpolate past `end` (the loop start when looping, otherwise 0). Returns the frame
+    /// Mixes forwards from frame `frame` until the position reaches `end` (fixed point) or the
+    /// output reaches `out_end`, handling any ramp in progress. `next_value` is the sample used
+    /// to interpolate past `end` (the loop start when looping, otherwise 0). Returns the frame
     /// reached.
     fn mix_forward(
         &mut self,
         mix: &mut Mix,
         mut frame: i32,
-        end: i32,
+        end: i64,
         out_end: i32,
         next_value: i32,
     ) -> i32 {
@@ -752,7 +780,7 @@ impl SampleVoice {
         &mut self,
         mix: &mut Mix,
         mut frame: i32,
-        start: i32,
+        start: i64,
         out_end: i32,
         previous_value: i32,
     ) -> i32 {
@@ -782,17 +810,19 @@ impl SampleVoice {
         mix: &mut Mix,
         mut frame: i32,
         frame_end: i32,
-        end: i32,
+        end: i64,
         next_value: i32,
         ramp: bool,
     ) -> i32 {
         let data = mix.data;
         let format = mix.format;
         let out = &mut *mix.out;
-        if self.step == 256 && self.position & 0xff == 0 {
+        let bits = self.frac_bits;
+        let one = 1i64 << bits;
+        if self.step == one && self.position & (one - 1) == 0 {
             // Step of exactly one sample on a sample boundary: no interpolation.
-            let mut index = self.position >> 8;
-            let limit = (frame + (end >> 8) - index).min(frame_end);
+            let mut index = self.position >> bits;
+            let limit = (frame as i64 + (end >> bits) - index).min(frame_end as i64) as i32;
             let shift = format.volume_shift();
             if format.stereo {
                 let (mut left, mut right) = (self.left_volume << shift, self.right_volume << shift);
@@ -837,7 +867,7 @@ impl SampleVoice {
                     self.volume = volume >> shift;
                 }
             }
-            self.position = index << 8;
+            self.position = index << bits;
             return frame;
         }
 
@@ -859,19 +889,20 @@ impl SampleVoice {
             let limit = if step == 0 {
                 frame_end
             } else if phase == 0 {
-                (frame + (end + step - position - 257) / step).min(frame_end)
+                (frame as i64 + (end + step - position - one - 1) / step).min(frame_end as i64)
+                    as i32
             } else {
-                (frame + (end + step - position - 1) / step).min(frame_end)
+                (frame as i64 + (end + step - position - 1) / step).min(frame_end as i64) as i32
             };
             while frame < limit {
-                let index = (position >> 8) as usize;
+                let index = (position >> bits) as usize;
                 let current = data[index] as i32;
                 let next = if phase == 0 {
                     data[index + 1] as i32
                 } else {
                     next_value
                 };
-                let value = format.interpolate(current, next, position & 0xff);
+                let value = format.interpolate(current, next, position & (one - 1), bits);
                 self.mix_value(
                     out,
                     frame,
@@ -897,16 +928,18 @@ impl SampleVoice {
         mix: &mut Mix,
         mut frame: i32,
         frame_end: i32,
-        start: i32,
+        start: i64,
         previous_value: i32,
         ramp: bool,
     ) -> i32 {
         let data = mix.data;
         let format = mix.format;
         let out = &mut *mix.out;
-        if self.step == -256 && self.position & 0xff == 0 {
-            let mut index = self.position >> 8;
-            let limit = (frame + index + 1 - (start >> 8)).min(frame_end);
+        let bits = self.frac_bits;
+        let one = 1i64 << bits;
+        if self.step == -one && self.position & (one - 1) == 0 {
+            let mut index = self.position >> bits;
+            let limit = (frame as i64 + index + 1 - (start >> bits)).min(frame_end as i64) as i32;
             let shift = format.volume_shift();
             if format.stereo {
                 let (mut left, mut right) = (self.left_volume << shift, self.right_volume << shift);
@@ -951,12 +984,12 @@ impl SampleVoice {
                     self.volume = volume >> shift;
                 }
             }
-            self.position = index << 8;
+            self.position = index << bits;
             return frame;
         }
 
         // Interpolating path. Going backwards, the value at position p interpolates between
-        // samples (p >> 8) - 1 and (p >> 8); below the loop start it interpolates from
+        // samples floor(p) - 1 and floor(p); below the loop start it interpolates from
         // `previous_value`.
         let step = self.step;
         let mut position = self.position;
@@ -973,18 +1006,19 @@ impl SampleVoice {
             let limit = if step == 0 {
                 frame_end
             } else if phase == 0 {
-                (frame + (start + step + 256 - position) / step).min(frame_end)
+                (frame as i64 + (start + step + one - position) / step).min(frame_end as i64) as i32
             } else {
-                (frame + (start + step - position) / step).min(frame_end)
+                (frame as i64 + (start + step - position) / step).min(frame_end as i64) as i32
             };
             while frame < limit {
-                let index = (position >> 8) as usize;
+                let index = (position >> bits) as usize;
                 let previous = if phase == 0 {
                     data[index - 1] as i32
                 } else {
                     previous_value
                 };
-                let value = format.interpolate(previous, data[index] as i32, position & 0xff);
+                let value =
+                    format.interpolate(previous, data[index] as i32, position & (one - 1), bits);
                 self.mix_value(
                     out,
                     frame,
@@ -1041,7 +1075,7 @@ impl SampleVoice {
     fn finish_interpolated_kernel(
         &mut self,
         frame: i32,
-        position: i32,
+        position: i64,
         volume: i32,
         left: i32,
         right: i32,

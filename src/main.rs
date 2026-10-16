@@ -37,6 +37,8 @@ enum EngineArg {
     Build530,
     /// Old School RuneScape
     Osrs,
+    /// Enhanced engine with higher default sample rate and better resampling
+    Enhanced,
 }
 
 impl From<EngineArg> for Engine {
@@ -44,6 +46,7 @@ impl From<EngineArg> for Engine {
         match engine {
             EngineArg::Build530 => Engine::Build530,
             EngineArg::Osrs => Engine::Osrs,
+            EngineArg::Enhanced => Engine::Enhanced,
         }
     }
 }
@@ -121,9 +124,9 @@ enum Command {
 
 #[derive(ClapArgs)]
 struct PlaybackArgs {
-    /// Synthesizer sample rate in Hz (default is 22050)
-    #[arg(long, default_value_t = 22050)]
-    rate: i32,
+    /// Synthesizer sample rate in Hz
+    #[arg(long)]
+    rate: Option<i32>,
     /// Render in mono instead of stereo
     #[arg(long)]
     mono: bool,
@@ -136,9 +139,9 @@ struct PlaybackArgs {
 }
 
 impl PlaybackArgs {
-    fn options(&self) -> PlaybackOptions {
+    fn options(&self, engine: Engine) -> PlaybackOptions {
         PlaybackOptions {
-            sample_rate: self.rate,
+            sample_rate: self.rate.unwrap_or(engine.default_sample_rate()),
             stereo: !self.mono,
             volume: self.volume,
             looping: self.looping,
@@ -177,7 +180,7 @@ fn main() -> Result<()> {
             render(
                 &data,
                 &song,
-                &playback.options(),
+                &playback.options(data.engine),
                 seconds,
                 tail,
                 raw,
@@ -190,11 +193,11 @@ fn main() -> Result<()> {
             output,
             playback,
             raw,
-        } => render_all(&data, &playback.options(), raw, &output),
+        } => render_all(&data, &playback.options(data.engine), raw, &output),
         Command::Play { song, playback } => {
             let (song, name) = load_song(&data, &song)?;
             println!("Playing \"{}\" (Ctrl-C to stop)", name);
-            let renderer = MusicRenderer::for_song(&data, &song, &playback.options())?;
+            let renderer = MusicRenderer::for_song(&data, &song, &playback.options(data.engine))?;
             audio::device::play(renderer)
         }
         Command::DumpSamples {
@@ -210,11 +213,12 @@ fn main() -> Result<()> {
             let engine_name = match data.engine {
                 Engine::Build530 => "2009scape",
                 Engine::Osrs => "osrs",
+                Engine::Enhanced => "enhanced",
             };
             if capture {
-                render_all(&data, &playback.options(), true, &dir.join(engine_name))
+                render_all(&data, &playback.options(data.engine), true, &dir.join(engine_name))
             } else {
-                validate_all(&data, &playback.options(), &dir.join(engine_name))
+                validate_all(&data, &playback.options(data.engine), &dir.join(engine_name))
             }
         }
     }

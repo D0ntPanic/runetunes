@@ -347,6 +347,11 @@ impl MidiSynth {
         synth
     }
 
+    /// Fractional bits of voice positions and steps.
+    fn position_frac_bits(&self) -> u32 {
+        self.engine.position_frac_bits()
+    }
+
     /// Samples per control tick (10 ms).
     fn tick_samples(&self) -> i32 {
         self.sample_rate / 100
@@ -670,9 +675,9 @@ impl MidiSynth {
         let pan = self.note_pan(&note);
         if self.channels[channel].sample_offset == 0 {
             let volume = self.note_volume(&note);
-            note.voice = SampleVoice::new(sample, step, volume, pan);
+            note.voice = SampleVoice::new(sample, self.position_frac_bits(), step, volume, pan);
         } else {
-            note.voice = SampleVoice::new(sample, step, 0, pan);
+            note.voice = SampleVoice::new(sample, self.position_frac_bits(), step, 0, pan);
             self.apply_sample_offset(&mut note, looped);
         }
         if looped {
@@ -923,13 +928,19 @@ impl MidiSynth {
                 if self.channels[channel].sample_offset == 0 {
                     note.voice = SampleVoice::new(
                         sample,
+                        old_voice.frac_bits(),
                         old_voice.rate(),
                         old_voice.target_volume(),
                         old_voice.target_pan(),
                     );
                 } else {
-                    note.voice =
-                        SampleVoice::new(sample, old_voice.rate(), 0, old_voice.target_pan());
+                    note.voice = SampleVoice::new(
+                        sample,
+                        old_voice.frac_bits(),
+                        old_voice.rate(),
+                        0,
+                        old_voice.target_pan(),
+                    );
                     self.apply_sample_offset(&mut note, looped);
                     if let Some(voice) = &mut note.voice {
                         voice.ramp_volume(fade, old_voice.target_volume());
@@ -1107,24 +1118,26 @@ impl MidiSynth {
         let Some(voice) = note.voice.as_mut() else {
             return;
         };
+        let bits = voice.frac_bits();
+        // The offset controller is 14-bit: it selects `offset / 2^14` of the way through.
         let position = if looped && sample.ping_pong {
             let total = length + length - sample.loop_start;
-            let length_fixed = length << 8;
-            let mut position = ((total as i64 * offset) >> 6) as i32;
+            let length_fixed = (length as i64) << bits;
+            let mut position = ((total as i64 * offset) << bits) >> 14;
             if position >= length_fixed {
                 voice.play_backwards();
                 position = length_fixed + length_fixed - position - 1;
             }
             position
         } else {
-            ((length as i64 * offset) >> 6) as i32
+            ((length as i64 * offset) << bits) >> 14
         };
         voice.set_position(position);
     }
 
-    /// Computes a note's playback step (24.8 fixed point) from its pitch, pitch bend,
-    /// portamento and vibrato.
-    fn note_step(&self, note: &ActiveNote) -> i32 {
+    /// Computes a note's playback step (fixed point, see [`Engine::position_frac_bits`]) from its
+    /// pitch, pitch bend, portamento and vibrato.
+    fn note_step(&self, note: &ActiveNote) -> i64 {
         let channel = &self.channels[note.channel];
         let articulation = note
             .articulation
@@ -1149,10 +1162,11 @@ impl MidiSynth {
         }
 
         // 3.2552e-4 = 1 / (12 * 256): pitch is in 1/256 semitones.
-        let step = ((sample.sample_rate * 256) as f64
-            * 2.0f64.powf(pitch as f64 * 3.255208333333333e-4)
-            / self.sample_rate as f64
-            + 0.5) as i32;
+        let one = (1i64 << self.position_frac_bits()) as f64;
+        let step =
+            (sample.sample_rate as f64 * one * 2.0f64.powf(pitch as f64 * 3.255208333333333e-4)
+                / self.sample_rate as f64
+                + 0.5) as i64;
         step.max(1)
     }
 
