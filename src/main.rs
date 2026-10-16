@@ -28,7 +28,7 @@ struct Args {
     #[arg(long, global = true)]
     engine: Option<EngineArg>,
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -77,7 +77,18 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         tail: f64,
         /// Write the raw 32-bit mix buffer (little-endian i32, interleaved) instead of a WAV
-        /// file, for bit-exact comparison with the Java oracle
+        /// file, for bit-exact comparisons
+        #[arg(long, hide = true)]
+        raw: bool,
+    },
+    RenderAll {
+        /// Directory to write the files to
+        #[arg(short, long, default_value = "output")]
+        output: PathBuf,
+        #[command(flatten)]
+        playback: PlaybackArgs,
+        /// Write the raw 32-bit mix buffer (little-endian i32, interleaved) instead of a WAV
+        /// file, for bit-exact comparisons
         #[arg(long, hide = true)]
         raw: bool,
     },
@@ -89,7 +100,7 @@ enum Command {
         #[command(flatten)]
         playback: PlaybackArgs,
     },
-    /// Decode every instrument sample of one kind into a directory (for oracle comparison)
+    /// Decode every instrument sample of one kind into a directory (for validation)
     #[command(hide = true)]
     DumpSamples {
         /// "vorbis" or "synth"
@@ -97,6 +108,14 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value_t = 22050)]
         rate: i32,
+    },
+    Validate {
+        #[arg(short, long, default_value = "validation")]
+        dir: PathBuf,
+        #[command(flatten)]
+        playback: PlaybackArgs,
+        #[arg(long)]
+        capture: bool,
     },
 }
 
@@ -132,9 +151,7 @@ fn main() -> Result<()> {
     let cache = Cache::new(&args.cache)?;
     let data = Data::new(cache, args.engine.map(Engine::from))?;
 
-    match args.command.unwrap_or(Command::Extract {
-        output: PathBuf::from("output"),
-    }) {
+    match args.command {
         Command::Extract { output } => extract(&data, &output),
         Command::List => {
             for (group, name) in song_list(&data) {
@@ -154,7 +171,9 @@ fn main() -> Result<()> {
             if playback.looping && seconds.is_none() {
                 return Err(anyhow!("--loop needs --seconds"));
             }
-            let output = output.unwrap_or_else(|| PathBuf::from(format!("{}.wav", name)));
+            let ext = if raw { "raw" } else { "wav" };
+            let output = output.unwrap_or_else(|| PathBuf::from(format!("{}.{}", name, ext)));
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&output)?);
             render(
                 &data,
                 &song,
@@ -162,11 +181,16 @@ fn main() -> Result<()> {
                 seconds,
                 tail,
                 raw,
-                &output,
+                &mut writer,
             )?;
             println!("Rendered \"{}\" to {}", name, output.display());
             Ok(())
         }
+        Command::RenderAll {
+            output,
+            playback,
+            raw,
+        } => render_all(&data, &playback.options(), raw, &output),
         Command::Play { song, playback } => {
             let (song, name) = load_song(&data, &song)?;
             println!("Playing \"{}\" (Ctrl-C to stop)", name);
@@ -178,6 +202,21 @@ fn main() -> Result<()> {
             output,
             rate,
         } => dump_samples(&data, &source, &output, rate),
+        Command::Validate {
+            dir,
+            playback,
+            capture,
+        } => {
+            let engine_name = match data.engine {
+                Engine::Build530 => "2009scape",
+                Engine::Osrs => "osrs",
+            };
+            if capture {
+                render_all(&data, &playback.options(), true, &dir.join(engine_name))
+            } else {
+                validate_all(&data, &playback.options(), &dir.join(engine_name))
+            }
+        }
     }
 }
 
@@ -221,11 +260,10 @@ fn render(
     seconds: Option<f64>,
     tail: f64,
     raw: bool,
-    output: &Path,
+    out: &mut impl Write,
 ) -> Result<()> {
     let mut renderer = MusicRenderer::for_song(data, song, options)?;
     let chunk_seconds = renderer.chunk_frames() as f64 / options.sample_rate as f64;
-    let mut out = std::io::BufWriter::new(std::fs::File::create(output)?);
     let mut pcm = Vec::new();
 
     // With a fixed length render that many chunks; otherwise render until the song stops,
@@ -256,13 +294,65 @@ fn render(
     }
     if !raw {
         wav::write(
-            &mut out,
+            out,
             options.sample_rate as u32,
             renderer.channels() as u16,
             &pcm,
         )?;
     }
     out.flush()?;
+    Ok(())
+}
+
+/// Renders all songs to an output directory
+fn render_all(data: &Data, options: &PlaybackOptions, raw: bool, output: &Path) -> Result<()> {
+    std::fs::create_dir_all(output)?;
+    for (group, name) in song_list(data) {
+        let song = Song::new(data, group)?;
+        let name = name.replace(['/', '\\', '\t'], "-");
+        let filename = name.replace([' ', '?', '&'], "-");
+        let ext = if raw { "raw" } else { "wav" };
+        let output = output.join(format!("{:04}-{}.{}", group, filename, ext));
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&output)?);
+        match render(data, &song, options, None, 1.0, raw, &mut writer) {
+            Ok(()) => println!("Rendered {} \"{}\" to {}", group, name, output.display()),
+            Err(error) => {
+                println!(
+                    "ERROR: Rendering of {} \"{}\" failed: {}",
+                    group, name, error
+                );
+                drop(writer);
+                std::fs::remove_file(&output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates all songs against a stored oracle
+fn validate_all(data: &Data, options: &PlaybackOptions, input: &Path) -> Result<()> {
+    let mut valid = 0;
+    let mut total = 0;
+    for (group, name) in song_list(data) {
+        let name = name.replace(['/', '\\', '\t'], "-");
+        let filename = name.replace([' ', '?', '&'], "-");
+        let input = input.join(format!("{:04}-{}.raw", group, filename));
+        if !input.exists() {
+            continue;
+        }
+        let input = std::fs::read(&input)?;
+        let song = Song::new(data, group)?;
+        let mut writer = std::io::BufWriter::new(Vec::new());
+        render(data, &song, options, None, 1.0, true, &mut writer)?;
+        if input == writer.into_inner()? {
+            valid += 1;
+            println!("OK: Validated {} \"{}\"", group, name);
+        } else {
+            println!("FAIL: Mismatching render for \"{}\"", name);
+        }
+        total += 1;
+    }
+    println!("{} of {} songs validated", valid, total);
     Ok(())
 }
 
@@ -275,7 +365,7 @@ fn extract(data: &Data, output: &Path) -> Result<()> {
         if entry.name.trim().is_empty() {
             continue;
         }
-        let name = entry.name.replace(['/', '\\'], "-");
+        let name = entry.name.replace(['/', '\\', '\t'], "-");
         let song = Song::new(data, entry.group)?;
         std::fs::write(output.join(format!("{}.mid", name)), song.as_midi()?)?;
 
