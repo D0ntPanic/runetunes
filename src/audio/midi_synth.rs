@@ -322,6 +322,7 @@ impl MidiSynth {
             format: MixFormat {
                 stereo,
                 wide: engine.wide_mixing(),
+                interpolation: engine.interpolation(),
             },
             sequencer: None,
             looping: false,

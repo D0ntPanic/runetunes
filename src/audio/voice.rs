@@ -1,6 +1,7 @@
 //! Resampling playback of a single [`Sample`].
 
 use super::sample::Sample;
+use super::sinc::{self, SincTable};
 use std::rc::Rc;
 
 /// Sentinel `target_volume` meaning "ramp to silence, then stop".
@@ -9,8 +10,9 @@ const FADE_OUT: i32 = i32::MIN;
 /// Pan value for the centre (pan runs from 0 = left to 16384 = right).
 pub const PAN_CENTER: i32 = 8192;
 
-/// Plays a [`Sample`] at an arbitrary rate, mixing it into a 32-bit output buffer with linear
-/// interpolation, volume/pan ramping and forward, reverse or ping-pong looping.
+/// Plays a [`Sample`] at an arbitrary rate, mixing it into a 32-bit output buffer with
+/// interpolation (see [`Interpolation`]), volume/pan ramping and forward, reverse or ping-pong
+/// looping.
 ///
 /// # Fixed-point conventions
 ///
@@ -43,6 +45,9 @@ pub struct SampleVoice {
     step: i64,
     /// Loop passes remaining: 0 = don't loop, -1 = loop forever.
     loops_remaining: i32,
+    /// Whether the position has wrapped or reflected at a loop boundary, so that the samples
+    /// before the loop start are no longer the ones that preceded the current position.
+    looped: bool,
 
     /// Volume the voice is heading towards, or [`FADE_OUT`].
     target_volume: i32,
@@ -90,6 +95,17 @@ fn right_gain(volume: i32, pan: i32) -> i32 {
     }
 }
 
+/// How voices reconstruct the sample between sample points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interpolation {
+    /// Linear interpolation between neighbouring samples, as in the original clients.
+    Linear,
+    /// A band-limited windowed-sinc kernel (see [`sinc`](super::sinc)), which suppresses the
+    /// images linear interpolation leaves when a sample plays slowly and the aliasing when it
+    /// plays fast.
+    Sinc,
+}
+
 /// The layout of the mix buffer and the kernels used to mix into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MixFormat {
@@ -100,6 +116,8 @@ pub struct MixFormat {
     /// 8-bit kernels interpolate as `(current << 8) + (next - current) * fraction` and scale
     /// non-interpolated samples by `volume << 2`.
     pub wide: bool,
+    /// Interpolation between sample points.
+    pub interpolation: Interpolation,
 }
 
 impl MixFormat {
@@ -164,6 +182,7 @@ impl SampleVoice {
             position: 0,
             step,
             loops_remaining: 0,
+            looped: false,
             target_volume: volume,
             target_pan: pan,
             volume: 0,
@@ -204,9 +223,11 @@ impl SampleVoice {
         self.step = if self.step < 0 { -rate } else { rate };
     }
 
-    /// Makes the voice play backwards.
+    /// Makes the voice play backwards, as if it had already reflected at the end of a
+    /// ping-pong loop.
     pub fn play_backwards(&mut self) {
         self.step = -self.step.abs();
+        self.looped = true;
     }
 
     /// Length of the sample in position units.
@@ -477,6 +498,7 @@ impl SampleVoice {
                             }
                             self.position = start + start - self.position - 1;
                             self.step = -self.step;
+                            self.looped = true;
                             self.loops_remaining -= 1;
                             if self.loops_remaining == 0 {
                                 break 'passes;
@@ -489,6 +511,7 @@ impl SampleVoice {
                             }
                             self.position = end + end - self.position - 1;
                             self.step = -self.step;
+                            self.looped = true;
                             self.loops_remaining -= 1;
                             if self.loops_remaining == 0 {
                                 break;
@@ -499,6 +522,7 @@ impl SampleVoice {
                             }
                             self.position = start + start - self.position - 1;
                             self.step = -self.step;
+                            self.looped = true;
                             self.loops_remaining -= 1;
                             if self.loops_remaining == 0 {
                                 break;
@@ -514,10 +538,12 @@ impl SampleVoice {
                         let wraps = (end - self.position - 1) / loop_length;
                         if wraps >= self.loops_remaining as i64 {
                             self.position += loop_length * self.loops_remaining as i64;
+                            self.looped = true;
                             self.loops_remaining = 0;
                             break;
                         }
                         self.position += loop_length * wraps;
+                        self.looped = true;
                         self.loops_remaining -= wraps as i32;
                     }
                 } else {
@@ -529,10 +555,12 @@ impl SampleVoice {
                         let wraps = (self.position - start) / loop_length;
                         if wraps >= self.loops_remaining as i64 {
                             self.position -= loop_length * self.loops_remaining as i64;
+                            self.looped = true;
                             self.loops_remaining = 0;
                             break;
                         }
                         self.position -= loop_length * wraps;
+                        self.looped = true;
                         self.loops_remaining -= wraps as i32;
                     }
                 }
@@ -562,6 +590,7 @@ impl SampleVoice {
                 }
                 self.position = start + start - self.position - 1;
                 self.step = -self.step;
+                self.looped = true;
             }
             loop {
                 frame = self.mix_forward(&mut mix, frame, end, out_end, loop_last());
@@ -570,12 +599,14 @@ impl SampleVoice {
                 }
                 self.position = end + end - self.position - 1;
                 self.step = -self.step;
+                self.looped = true;
                 frame = self.mix_backward(&mut mix, frame, start, out_end, loop_first);
                 if self.position >= start {
                     return;
                 }
                 self.position = start + start - self.position - 1;
                 self.step = -self.step;
+                self.looped = true;
             }
         } else if self.step < 0 {
             loop {
@@ -584,6 +615,7 @@ impl SampleVoice {
                     return;
                 }
                 self.position = end - (end - 1 - self.position) % loop_length - 1;
+                self.looped = true;
             }
         } else {
             loop {
@@ -592,6 +624,7 @@ impl SampleVoice {
                     return;
                 }
                 self.position = start + (self.position - start) % loop_length;
+                self.looped = true;
             }
         }
     }
@@ -655,6 +688,7 @@ impl SampleVoice {
                             }
                             self.position = start + start - self.position - 1;
                             self.step = -self.step;
+                            self.looped = true;
                             self.loops_remaining -= 1;
                             if self.loops_remaining == 0 {
                                 break 'passes;
@@ -666,6 +700,7 @@ impl SampleVoice {
                             }
                             self.position = end + end - self.position - 1;
                             self.step = -self.step;
+                            self.looped = true;
                             self.loops_remaining -= 1;
                             if self.loops_remaining == 0 {
                                 break;
@@ -675,6 +710,7 @@ impl SampleVoice {
                             }
                             self.position = start + start - self.position - 1;
                             self.step = -self.step;
+                            self.looped = true;
                             self.loops_remaining -= 1;
                             if self.loops_remaining == 0 {
                                 break;
@@ -688,10 +724,12 @@ impl SampleVoice {
                     let wraps = (end - self.position - 1) / loop_length;
                     if wraps < self.loops_remaining as i64 {
                         self.position += loop_length * wraps;
+                        self.looped = true;
                         self.loops_remaining -= wraps as i32;
                         return;
                     }
                     self.position += loop_length * self.loops_remaining as i64;
+                    self.looped = true;
                     self.loops_remaining = 0;
                 } else {
                     if self.position < end {
@@ -700,10 +738,12 @@ impl SampleVoice {
                     let wraps = (self.position - start) / loop_length;
                     if wraps < self.loops_remaining as i64 {
                         self.position -= loop_length * wraps;
+                        self.looped = true;
                         self.loops_remaining -= wraps as i32;
                         return;
                     }
                     self.position -= loop_length * self.loops_remaining as i64;
+                    self.looped = true;
                     self.loops_remaining = 0;
                 }
             }
@@ -725,22 +765,27 @@ impl SampleVoice {
                 }
                 self.position = start + start - self.position - 1;
                 self.step = -self.step;
+                self.looped = true;
             }
             while self.position >= end {
                 self.position = end + end - self.position - 1;
                 self.step = -self.step;
+                self.looped = true;
                 if self.position >= start {
                     return;
                 }
                 self.position = start + start - self.position - 1;
                 self.step = -self.step;
+                self.looped = true;
             }
         } else if self.step < 0 {
             if self.position < start {
                 self.position = end - (end - 1 - self.position) % loop_length - 1;
+                self.looped = true;
             }
         } else if self.position >= end {
             self.position = start + (self.position - start) % loop_length;
+            self.looped = true;
         }
     }
 
@@ -814,6 +859,9 @@ impl SampleVoice {
         next_value: i32,
         ramp: bool,
     ) -> i32 {
+        if mix.format.interpolation == Interpolation::Sinc {
+            return self.kernel_sinc(mix, frame, frame_end, end, ramp);
+        }
         let data = mix.data;
         let format = mix.format;
         let out = &mut *mix.out;
@@ -932,6 +980,9 @@ impl SampleVoice {
         previous_value: i32,
         ramp: bool,
     ) -> i32 {
+        if mix.format.interpolation == Interpolation::Sinc {
+            return self.kernel_sinc(mix, frame, frame_end, start, ramp);
+        }
         let data = mix.data;
         let format = mix.format;
         let out = &mut *mix.out;
@@ -1037,6 +1088,138 @@ impl SampleVoice {
         frame
     }
 
+    /// Windowed-sinc mixing kernel for both directions. Mixes frames `frame..frame_end` while
+    /// the position stays inside the region bounded by `bound` (below the `end` passed to
+    /// [`Self::kernel_forward`] when playing forwards, at or above the `start` passed to
+    /// [`Self::kernel_backward`] when playing backwards) and returns the frame reached.
+    ///
+    /// Like the linear kernels, playing backwards from position `p` reads the sample at `p - 1`.
+    /// That makes ping-pong reflections (`p' = 2 * end - p - 1`) mirror the sample about
+    /// half a sample before each loop boundary, which is what [`Self::tap`] assumes.
+    fn kernel_sinc(
+        &mut self,
+        mix: &mut Mix,
+        mut frame: i32,
+        frame_end: i32,
+        bound: i64,
+        ramp: bool,
+    ) -> i32 {
+        let data = mix.data;
+        let format = mix.format;
+        let out = &mut *mix.out;
+        let bits = self.frac_bits;
+        let one = 1i64 << bits;
+        let step = self.step;
+        let limit = if step > 0 {
+            (frame as i64 + (bound + step - self.position - 1) / step).min(frame_end as i64) as i32
+        } else if step < 0 {
+            (frame as i64 + (bound + step - self.position) / step).min(frame_end as i64) as i32
+        } else {
+            frame_end
+        };
+
+        let table = SincTable::for_ratio(step.unsigned_abs() as f64 / one as f64);
+        let read_offset = if step < 0 { one } else { 0 };
+        let phase_shift = bits - sinc::PHASE_BITS;
+        let blend_scale = 1.0 / (1u64 << phase_shift) as f32;
+        let value_scale = if format.wide { 1.0 } else { 256.0 };
+        let (direct_start, direct_end) = self.direct_range();
+
+        let mut position = self.position;
+        let (mut volume, mut left, mut right) = (self.volume, self.left_volume, self.right_volume);
+        if ramp {
+            if format.stereo {
+                self.volume -= self.volume_delta * frame;
+            } else {
+                self.left_volume -= self.left_delta * frame;
+                self.right_volume -= self.right_delta * frame;
+            }
+        }
+        while frame < limit {
+            let at = position - read_offset;
+            let fraction = at & (one - 1);
+            let (a, b) = table.rows((fraction >> phase_shift) as usize);
+            let blend = (fraction & ((1 << phase_shift) - 1)) as f32 * blend_scale;
+            let first = (at >> bits) - table.half as i64 + 1;
+            let (mut sum_a, mut sum_b) = (0f32, 0f32);
+            if first >= direct_start && first + table.taps as i64 <= direct_end {
+                let window = &data[first as usize..first as usize + table.taps];
+                for i in 0..table.taps {
+                    let x = window[i] as f32;
+                    sum_a += x * a[i];
+                    sum_b += x * b[i];
+                }
+            } else {
+                for i in 0..table.taps {
+                    let x = self.tap(data, first + i as i64);
+                    sum_a += x * a[i];
+                    sum_b += x * b[i];
+                }
+            }
+            let value = ((sum_a + (sum_b - sum_a) * blend) * value_scale).round() as i32;
+            self.mix_value(
+                out,
+                frame,
+                value,
+                &mut volume,
+                &mut left,
+                &mut right,
+                format.stereo,
+                ramp,
+            );
+            position = position.wrapping_add(step);
+            frame += 1;
+        }
+        self.finish_interpolated_kernel(frame, position, volume, left, right, format.stereo, ramp);
+        frame
+    }
+
+    /// Range of sample indices whose taps read the sample data directly in the current loop
+    /// state; [`Self::tap`] is needed outside it.
+    fn direct_range(&self) -> (i64, i64) {
+        let length = self.sample.len() as i64;
+        if self.loops_remaining == 0 {
+            (0, length)
+        } else {
+            let start = if self.looped {
+                self.loop_start as i64
+            } else {
+                0
+            };
+            (start.max(0), (self.loop_end as i64).min(length))
+        }
+    }
+
+    /// The sample value the sinc kernel sees at `index`: the signal the voice actually plays,
+    /// continued past the loop boundaries. While looping, indices at or past the loop end (and
+    /// before the loop start once the voice has looped) wrap around the loop, or mirror about
+    /// half a sample inside its boundaries for ping-pong loops. Everything else outside the
+    /// sample is silence.
+    fn tap(&self, data: &[i16], index: i64) -> f32 {
+        let (start, end) = (self.loop_start as i64, self.loop_end as i64);
+        let index = if self.loops_remaining != 0 && (index >= end || (index < start && self.looped))
+        {
+            let length = end - start;
+            if self.ping_pong {
+                let offset = (index - start).rem_euclid(2 * length);
+                if offset < length {
+                    start + offset
+                } else {
+                    start + 2 * length - 1 - offset
+                }
+            } else {
+                start + (index - start).rem_euclid(length)
+            }
+        } else {
+            index
+        };
+        if index < 0 {
+            0.0
+        } else {
+            data.get(index as usize).map_or(0.0, |&value| value as f32)
+        }
+    }
+
     /// Mixes one interpolated value (scaled as returned by [`Mix::interpolate`]) into the
     /// output.
     #[inline(always)]
@@ -1094,5 +1277,180 @@ impl SampleVoice {
             }
         }
         self.position = position;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BITS: u32 = 32;
+    const AMPLITUDE: f64 = 16000.0;
+
+    /// Plays `sample` mono at unity gain, `ratio` samples per output sample, and returns
+    /// `count` output frames after skipping `skip`.
+    fn render(
+        sample: Sample,
+        ratio: f64,
+        interpolation: Interpolation,
+        skip: usize,
+        count: usize,
+    ) -> Vec<f64> {
+        let looped = sample.loop_end > sample.loop_start;
+        let step = (ratio * (1u64 << BITS) as f64).round() as i64;
+        // Volume 64 mixes 16-bit samples at unity.
+        let mut voice = SampleVoice::new(Rc::new(sample), BITS, step, 64, -1).unwrap();
+        if looped {
+            voice.set_loops(-1);
+        }
+        let format = MixFormat {
+            stereo: false,
+            wide: true,
+            interpolation,
+        };
+        let mut out = vec![0i32; skip + count];
+        // Render in uneven chunks so loop boundaries fall inside calls.
+        let mut offset = 0;
+        while offset < out.len() {
+            let chunk = 333.min(out.len() - offset);
+            voice.read(&mut out, offset, chunk, format);
+            offset += chunk;
+        }
+        out[skip..].iter().map(|&value| value as f64).collect()
+    }
+
+    /// Power of whatever isn't a sinusoid at `frequency` (cycles per frame), relative to the
+    /// sinusoid, in dB. `signal` must span a whole number of cycles.
+    fn residual_db(signal: &[f64], frequency: f64) -> f64 {
+        let n = signal.len() as f64;
+        let angle = |i: usize| 2.0 * std::f64::consts::PI * frequency * i as f64;
+        let a: f64 = signal
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x * angle(i).sin())
+            .sum::<f64>()
+            * 2.0
+            / n;
+        let b: f64 = signal
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x * angle(i).cos())
+            .sum::<f64>()
+            * 2.0
+            / n;
+        let (mut fit_power, mut residual_power) = (0.0, 0.0);
+        for (i, &x) in signal.iter().enumerate() {
+            let fit = a * angle(i).sin() + b * angle(i).cos();
+            fit_power += fit * fit;
+            residual_power += (x - fit) * (x - fit);
+        }
+        10.0 * (residual_power / fit_power).log10()
+    }
+
+    fn sample(data: Vec<i16>, loop_start: i32, loop_end: i32, ping_pong: bool) -> Sample {
+        Sample {
+            sample_rate: 22050,
+            data,
+            loop_start,
+            loop_end,
+            ping_pong,
+        }
+    }
+
+    /// A tone in a forward loop entered from silence, played two octaves down: after the first
+    /// pass, the sinc kernel must see the loop's end before its start, not the silence.
+    #[test]
+    fn sinc_forward_loop_is_clean() {
+        let period = 20;
+        let data: Vec<i16> = (0..400)
+            .map(|i| {
+                if i < 200 {
+                    0
+                } else {
+                    let phase = (i - 200) as f64 / period as f64;
+                    (AMPLITUDE * (2.0 * std::f64::consts::PI * phase).sin()).round() as i16
+                }
+            })
+            .collect();
+        let measure = |interpolation| {
+            let out = render(
+                sample(data.clone(), 200, 400, false),
+                0.25,
+                interpolation,
+                4000,
+                8000,
+            );
+            residual_db(&out, 0.25 / period as f64)
+        };
+        let (linear, sinc) = (measure(Interpolation::Linear), measure(Interpolation::Sinc));
+        println!(
+            "forward loop residual: linear {:.1} dB, sinc {:.1} dB",
+            linear, sinc
+        );
+        assert!(sinc < -85.0, "sinc residual {:.1} dB", sinc);
+        assert!(sinc < linear - 30.0);
+    }
+
+    /// A ping-pong loop around a tone that is symmetric about both reflection points, so the
+    /// played signal is a pure tone in both directions.
+    #[test]
+    fn sinc_ping_pong_loop_is_clean() {
+        let (period, start, end) = (20.0, 100, 200);
+        let data: Vec<i16> = (0..end)
+            .map(|i| {
+                if i < start {
+                    0
+                } else {
+                    let phase = (i as f64 - (start as f64 - 0.5)) / period;
+                    (AMPLITUDE * (2.0 * std::f64::consts::PI * phase).cos()).round() as i16
+                }
+            })
+            .collect();
+        let measure = |interpolation| {
+            let out = render(
+                sample(data.clone(), start, end, true),
+                0.25,
+                interpolation,
+                4000,
+                8000,
+            );
+            residual_db(&out, 0.25 / period)
+        };
+        let (linear, sinc) = (measure(Interpolation::Linear), measure(Interpolation::Sinc));
+        println!(
+            "ping-pong residual: linear {:.1} dB, sinc {:.1} dB",
+            linear, sinc
+        );
+        assert!(sinc < -85.0, "sinc residual {:.1} dB", sinc);
+        assert!(sinc < linear - 30.0);
+    }
+
+    /// A tone at 0.4 cycles per sample played 1.7 times faster lies above the output Nyquist
+    /// frequency, so it must be filtered out instead of aliasing, while a tone at 0.1 cycles
+    /// per sample passes.
+    #[test]
+    fn sinc_filters_content_above_output_nyquist() {
+        let level = |frequency: f64, interpolation| {
+            let data: Vec<i16> = (0..20000)
+                .map(|i| {
+                    let phase = frequency * i as f64;
+                    (AMPLITUDE * (2.0 * std::f64::consts::PI * phase).sin()).round() as i16
+                })
+                .collect();
+            let out = render(sample(data, 0, 0, false), 1.7, interpolation, 100, 10000);
+            let power = out.iter().map(|x| x * x).sum::<f64>() / out.len() as f64;
+            10.0 * (power / (AMPLITUDE * AMPLITUDE / 2.0)).log10()
+        };
+        let (linear, sinc) = (
+            level(0.4, Interpolation::Linear),
+            level(0.4, Interpolation::Sinc),
+        );
+        let passed = level(0.1, Interpolation::Sinc);
+        println!(
+            "aliased level: linear {:.1} dB, sinc {:.1} dB; in-band level {:.2} dB",
+            linear, sinc, passed
+        );
+        assert!(sinc < -60.0, "sinc alias level {:.1} dB", sinc);
+        assert!(passed.abs() < 0.1, "sinc in-band level {:.2} dB", passed);
     }
 }

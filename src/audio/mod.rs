@@ -25,7 +25,8 @@
 //!    expression, pan, pitch bend, sustain, portamento, ...) and owns the sounding notes. Every
 //!    10 ms "control tick" each note's pitch and envelopes are updated.
 //! 2. Each note plays its sample through a [`voice::SampleVoice`], which resamples with linear
-//!    interpolation, handles loops and ramps volume/pan smoothly between control ticks.
+//!    interpolation (windowed sinc in [`Engine::Enhanced`]), handles loops and ramps
+//!    volume/pan smoothly between control ticks.
 //! 3. [`renderer::MusicRenderer`] renders 256 or 512-frame chunks into a 32-bit mix buffer,
 //!    periodically runs a 32-voice limiter, and converts to 16-bit output.
 //! 4. [`device`] streams the output to a sound card with `cpal`.
@@ -42,6 +43,7 @@ pub mod patch;
 pub mod renderer;
 pub mod sample;
 pub mod sample_bank;
+pub mod sinc;
 pub mod synth;
 pub mod voice;
 pub mod vorbis;
@@ -51,6 +53,7 @@ use crate::song::Song;
 use anyhow::Result;
 use midi_synth::MidiSynth;
 use renderer::MusicRenderer;
+use voice::Interpolation;
 
 /// Which version of the client's music engine to reproduce.
 ///
@@ -131,6 +134,16 @@ impl Engine {
         match self {
             Engine::Build530 | Engine::Osrs => 8,
             Engine::Enhanced => 32,
+        }
+    }
+
+    /// How voices interpolate between sample points. The original clients interpolate
+    /// linearly, which leaves strong images of the sample's spectrum when it plays below its
+    /// native rate (especially audible on low notes) and aliases when it plays above it.
+    pub fn interpolation(self) -> Interpolation {
+        match self {
+            Engine::Build530 | Engine::Osrs => Interpolation::Linear,
+            Engine::Enhanced => Interpolation::Sinc,
         }
     }
 

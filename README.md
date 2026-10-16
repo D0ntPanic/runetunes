@@ -25,6 +25,11 @@ runetunes CACHE render 42 -o out.wav # songs can also be selected by group ID
 The engine version is detected from the cache. `--engine build530` or `--engine osrs`
 overrides the engine version.
 
+An enhanced engine is available with `--engine enhanced`. This fixes pitch issues at higher
+sampling rates and defaults to 48kHz rendering. It also uses an improved resampling filter that
+reduces artifacts, especially with low notes. Nothing else is changed, so songs keep the same
+flavor, but sound cleaner.
+
 Rendering and playback options:
 
 | Option | Default | Meaning |
