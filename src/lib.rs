@@ -5,4 +5,5 @@ pub mod cache;
 pub mod data;
 pub mod shuffle;
 pub mod song;
+pub mod soundbank;
 pub mod wav;

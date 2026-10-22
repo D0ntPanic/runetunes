@@ -549,6 +549,28 @@ impl Song {
     /// needed get loaded. Returns a map from patch number to the keys used.
     pub fn patch_usage(&self) -> BTreeMap<u32, [bool; 128]> {
         let mut usage = BTreeMap::new();
+        self.for_each_note(|_, patch, note| {
+            usage.entry(patch).or_insert([false; 128])[note as usize] = true;
+        });
+        usage
+    }
+
+    /// Determines which patches each track plays notes with. Returns one list per track, in
+    /// the order the patches are first played. Patch selections carry across tracks that share
+    /// a channel, as they do during playback.
+    pub fn patches_by_track(&self) -> Vec<Vec<u32>> {
+        let mut patches = vec![Vec::new(); self.tracks.len()];
+        self.for_each_note(|track, patch, _| {
+            let track_patches = &mut patches[track];
+            if !track_patches.contains(&patch) {
+                track_patches.push(patch);
+            }
+        });
+        patches
+    }
+
+    /// Calls `f` with the track index, patch and note of every note played, in playback order.
+    fn for_each_note(&self, mut f: impl FnMut(usize, u32, u8)) {
         let mut patch = [0u32; 16];
         patch[9] = 0x80;
         for event in &self.events {
@@ -562,14 +584,10 @@ impl Song {
                     channel,
                     note,
                     velocity,
-                } if velocity > 0 => {
-                    usage.entry(patch[channel as usize]).or_insert([false; 128])[note as usize] =
-                        true;
-                }
+                } if velocity > 0 => f(event.track, patch[channel as usize], note),
                 _ => (),
             }
         }
-        usage
     }
 
     fn track_midi(&self, track: &Track) -> Result<Vec<u8>> {
@@ -680,8 +698,10 @@ impl Song {
         Ok(out.data())
     }
 
-    /// Convert the song to MIDI format
-    pub fn as_midi_per_track(&self) -> Result<Vec<Vec<u8>>> {
+    /// Convert each track of the song to a separate MIDI file. A leading track holding only the
+    /// tempo is merged into every other track instead. Returns the index of each exported track
+    /// in `tracks` along with its MIDI data.
+    pub fn as_midi_per_track(&self) -> Result<Vec<(usize, Vec<u8>)>> {
         let mut result = Vec::new();
 
         // First track often contains just the tempo for the song
@@ -702,7 +722,7 @@ impl Song {
         }
 
         // Write each track
-        for track in self.tracks.iter().skip(skip_count) {
+        for (index, track) in self.tracks.iter().enumerate().skip(skip_count) {
             let mut out = OutputBuffer::new();
 
             // Write header
@@ -721,7 +741,7 @@ impl Song {
             out.write_u32(track_out.len() as u32);
             out.write_bytes(&track_out);
 
-            result.push(out.data());
+            result.push((index, out.data()));
         }
 
         Ok(result)

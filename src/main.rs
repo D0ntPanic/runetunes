@@ -5,6 +5,7 @@ pub mod cache;
 pub mod data;
 pub mod shuffle;
 pub mod song;
+pub mod soundbank;
 pub mod wav;
 
 use anyhow::{anyhow, Result};
@@ -469,8 +470,17 @@ fn extract(data: &Data, output: &Path) -> Result<()> {
         let song = Song::new(data, entry.group)?;
         std::fs::write(output.join(format!("{}.mid", name)), song.as_midi()?)?;
 
-        for (i, track) in song.as_midi_per_track()?.into_iter().enumerate() {
-            std::fs::write(output.join(format!("{}_track{}.mid", name, i)), track)?;
+        // Name each track file after the instruments the track plays.
+        let track_patches = song.patches_by_track();
+        for (i, (index, track)) in song.as_midi_per_track()?.into_iter().enumerate() {
+            let mut filename = format!("{}_track{}", name, i);
+            for patch in &track_patches[index] {
+                let instrument = soundbank::patch_name(*patch)
+                    .map(|name| name.replace(['/', '\\', '\t'], "-"))
+                    .unwrap_or_else(|| format!("Patch {}", patch));
+                filename = format!("{}_{}", filename, instrument);
+            }
+            std::fs::write(output.join(format!("{}.mid", filename)), track)?;
         }
 
         for id in song.patch_usage().keys() {
