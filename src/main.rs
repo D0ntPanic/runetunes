@@ -24,8 +24,10 @@ use std::path::{Path, PathBuf};
 /// cache.
 #[derive(Parser)]
 struct Args {
-    /// Path to the cache directory (containing main_file_cache.dat2 and the .idx files)
-    cache: PathBuf,
+    /// Path to the cache directory (containing main_file_cache.dat2 and the .idx files,
+    /// defaults to RuneLite cache)
+    #[arg(long, global = true)]
+    cache: Option<PathBuf>,
     /// Music engine to emulate. By default it is detected from the cache.
     #[arg(long, global = true)]
     engine: Option<EngineArg>,
@@ -160,9 +162,16 @@ impl PlaybackArgs {
     }
 }
 
+fn default_cache_path() -> Result<PathBuf> {
+    let home = std::env::home_dir().ok_or_else(|| {
+        anyhow!("the home directory is unknown, provide a cache path with --cache")
+    })?;
+    Ok(home.join(".runelite/jagexcache/oldschool/LIVE"))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cache = Cache::new(&args.cache)?;
+    let cache = Cache::new(&args.cache.map(Ok).unwrap_or_else(default_cache_path)?)?;
     let data = Data::new(cache, args.engine.map(Engine::from))?;
 
     match args.command {

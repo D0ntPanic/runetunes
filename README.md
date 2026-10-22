@@ -23,17 +23,19 @@ cargo install --locked --path .
 ## Usage
 
 ```sh
-runetunes CACHE play "Harmony"       # play on the default audio device
-runetunes CACHE play my_song.mid     # play any MIDI file with the game's instruments
-runetunes CACHE shuffle songs.txt    # play the songs listed in a file, shuffled, until Ctrl-C
-runetunes CACHE extract              # export every song as MIDI (+ raw patch files) to ./output
-runetunes CACHE extract -o DIR       # same, to DIR
-runetunes CACHE list                 # list songs with their group IDs
-runetunes CACHE render "Harmony"     # render a song to Harmony.wav
-runetunes CACHE render 42 -o out.wav # songs can also be selected by group ID
+runetunes play "Harmony"       # play on the default audio device
+runetunes play my_song.mid     # play any MIDI file with the game's instruments
+runetunes shuffle songs.txt    # play the songs listed in a file, shuffled, until Ctrl-C
+runetunes extract              # export every song as MIDI (+ raw patch files) to ./output
+runetunes extract -o DIR       # same, to DIR
+runetunes list                 # list songs with their group IDs
+runetunes render "Harmony"     # render a song to Harmony.wav
+runetunes render 42 -o out.wav # songs can also be selected by group ID
 ```
 
-`CACHE` is the cache directory containing `main_file_cache.dat2` and the `.idx` files.
+The default is to play music out of the game cache stored by RuneLite. This can be overriden
+using the `--cache` option specifying the cache directory containing `main_file_cache.dat2`
+and the `.idx` files.
 
 A `shuffle` playlist lists one song per line, by name or group ID; blank lines are ignored.
 Each song plays once in a random order, and after that the order keeps reshuffling, but a song
